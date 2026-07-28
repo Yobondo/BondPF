@@ -1,0 +1,19 @@
+# Generated output - recreated on every run, no need to version it
+bondpf_chart.png
+history_chart.png
+
+# Portfolio value history - reveals real total value, keep private
+history.csv
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# Local secrets/config (used later for email credentials)
+.env
+
+# Real portfolio data - never published
+my_portfolio.py
+
+# Log output from scheduled runs
+bondpf.log
