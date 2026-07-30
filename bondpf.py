@@ -340,6 +340,59 @@ def check_alerts(positions):
 
 
 # ---------------------------------------------------------------
+# AI COMMENTARY (Claude API)
+# ---------------------------------------------------------------
+
+def ai_commentary(positions):
+    """Ask Claude to write a short plain-English note about how the
+    portfolio moved today. Returns the text, or "" if no API key."""
+    api_key = load_secret("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("No ANTHROPIC_API_KEY in .env - skipping AI commentary.")
+        return ""
+
+    # Import here (not at the top) so the whole script still runs for
+    # people who haven't installed the anthropic library yet.
+    try:
+        import anthropic
+    except ImportError:
+        print("anthropic library not installed - run: pip3 install anthropic")
+        return ""
+
+    # Build a compact text summary of the portfolio to hand to Claude.
+    # We only send what's useful: ticker, day move, total gain, flag,
+    # and the news headline we already fetched.
+    lines = []
+    for p in positions:
+        line = (f"{p['symbol']}: {p['day_change_pct']:+.1f}% today, "
+                f"{p['gain_pct']:+.1f}% overall, {p['valuation']}")
+        if p["headline"]:
+            line += f" | news: {p['headline']}"
+        lines.append(line)
+    portfolio_text = "\n".join(lines)
+
+    # The prompt tells Claude who it's writing for and what we want.
+    prompt = (
+        "You are a concise portfolio assistant. Below is today's snapshot "
+        "of my stock holdings (daily move, overall gain, valuation flag, and "
+        "a recent news headline where available). Write a short morning note "
+        "(4-6 sentences) explaining what stands out today and why, connecting "
+        "moves to the news where it fits. Be factual and calm. Do NOT give "
+        "buy/sell advice. End with one thing worth watching.\n\n"
+        f"{portfolio_text}"
+    )
+
+    client = anthropic.Anthropic(api_key=api_key)
+    message = client.messages.create(
+        model="claude-sonnet-5",
+        max_tokens=400,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    # The reply comes back as a list of content blocks; we want the text.
+    return message.content[0].text
+
+
+# ---------------------------------------------------------------
 # MAIN - runs only when you execute this file directly
 # ---------------------------------------------------------------
 
@@ -350,4 +403,11 @@ if __name__ == "__main__":
     make_chart(positions, os.path.join(SCRIPT_DIR, "bondpf_chart.png"))
     check_alerts(positions)
     make_history_chart()
+
+    # Ask Claude for a morning note, print it, and email it to yourself.
+    note = ai_commentary(positions)
+    if note:
+        print("\n=== AI Morning Note ===")
+        print(note)
+        send_email("📊 BondPF: your morning note", note)
 
