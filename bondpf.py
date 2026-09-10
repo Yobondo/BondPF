@@ -9,6 +9,7 @@ import smtplib                          # talks to mail servers
 from datetime import date               # today's date for the history log
 from email.message import EmailMessage  # builds the email itself
 
+import requests                           # sends the Telegram message
 import yfinance as yf
 import matplotlib
 matplotlib.use("Agg")   # draw charts to a file, no window needed
@@ -334,52 +335,151 @@ def check_alerts(positions):
         lines.append(f"⚠️ {p['symbol']} is down {abs(p['day_change_pct']):.1f}% today "
                      f"(${p['price']:.2f})")
 
-    subject = ("🚨 BondPF: big dip alert" if big_dips
-               else "⚠️ BondPF: dip alert")
-    send_email(subject, "\n".join(lines))
+    header = ("🚨 BondPF: big dip alert" if big_dips
+              else "⚠️ BondPF: dip alert")
+    send_telegram(header + "\n" + "\n".join(lines))
 
 
 # ---------------------------------------------------------------
-# AI COMMENTARY (Claude API)
+# TELEGRAM
 # ---------------------------------------------------------------
 
-def ai_commentary(positions):
-    """Ask Claude to write a short plain-English note about how the
-    portfolio moved today. Returns the text, or "" if no API key."""
+def send_telegram(text):
+    """Send a message to yourself on Telegram. Needs a bot token and
+    your chat id in .env. Skips quietly if either is missing."""
+    token = load_secret("TELEGRAM_BOT_TOKEN")
+    chat_id = load_secret("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        print("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing from .env - skipping Telegram.")
+        return
+
+    # Telegram's whole API is just web requests. We POST the message
+    # to the bot's sendMessage endpoint.
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
+    try:
+        r = requests.post(url, data=payload, timeout=15)
+        if r.status_code == 200:
+            print("Telegram message sent.")
+        else:
+            print(f"Telegram error {r.status_code}: {r.text}")
+    except Exception as e:
+        print(f"Telegram send failed: {e}")
+
+
+# ---------------------------------------------------------------
+# MORNING BRIEF (structured facts + AI synthesis)
+# ---------------------------------------------------------------
+
+def weekly_trend():
+    """Look at history.csv and say whether the portfolio is trending
+    up, down, or flat over roughly the last week. Returns text or None."""
+    path = os.path.join(SCRIPT_DIR, "history.csv")
+    if not os.path.exists(path):
+        return None
+    values = []
+    with open(path) as f:
+        next(f, None)                 # skip the header row
+        for line in f:
+            parts = line.strip().split(",")
+            try:
+                values.append(float(parts[1]))
+            except (IndexError, ValueError):
+                continue
+    if len(values) < 2:
+        return None
+    now = values[-1]
+    # Compare to ~5 entries ago (a trading week), or the oldest we have.
+    past = values[-6] if len(values) >= 6 else values[0]
+    if now > past * 1.001:
+        return "trending up ↗"
+    if now < past * 0.999:
+        return "trending down ↘"
+    return "roughly flat →"
+
+
+def build_facts(positions):
+    """Assemble the structured, non-AI part of the brief straight from
+    our own numbers. Returns a formatted string."""
+    total_value = sum(p["market_value"] for p in positions)
+    total_gain = sum(p["gain"] for p in positions)
+    total_cost = total_value - total_gain
+    total_pct = (total_gain / total_cost * 100) if total_cost else 0
+
+    # Portfolio-level day move: rebuild yesterday's value from each
+    # position's day change, then compare.
+    prev_value = sum(p["market_value"] / (1 + p["day_change_pct"] / 100)
+                     for p in positions)
+    day_pct = ((total_value - prev_value) / prev_value * 100) if prev_value else 0
+
+    today = date.today().strftime("%a %b %d")
+    out = [f"📊 BondPF Morning Brief — {today}", ""]
+
+    # --- SNAPSHOT ---
+    arrow = "▲" if day_pct >= 0 else "▼"
+    out.append("💰 SNAPSHOT")
+    out.append(f"Total value: ${total_value:,.0f} ({arrow}{abs(day_pct):.1f}% today)")
+    out.append(f"Overall P/L: {total_gain:+,.0f} ({total_pct:+.1f}%)")
+    trend = weekly_trend()
+    if trend:
+        out.append(f"This week: {trend}")
+    out.append("")
+
+    # --- TODAY'S MOVERS --- (biggest gainers and losers by day move)
+    ranked = sorted(positions, key=lambda p: p["day_change_pct"], reverse=True)
+    gainers = [p for p in ranked if p["day_change_pct"] > 0][:3]
+    losers = [p for p in reversed(ranked) if p["day_change_pct"] < 0][:3]
+    out.append("🔺 TODAY'S MOVERS")
+    for p in gainers + losers:
+        a = "▲" if p["day_change_pct"] >= 0 else "▼"
+        row = f"• {p['symbol']} {a}{abs(p['day_change_pct']):.1f}%"
+        if p["headline"]:
+            row += f" — {p['headline']}"
+        out.append(row)
+    out.append("")
+
+    # --- VALUATION WATCH ---
+    under = [p["symbol"] for p in positions if p["valuation"] == "UNDERVALUED"]
+    over = [p["symbol"] for p in positions if p["valuation"] == "OVERVALUED"]
+    out.append("🎯 VALUATION WATCH")
+    out.append(f"Undervalued: {', '.join(under) if under else 'none'}")
+    out.append(f"Overvalued: {', '.join(over) if over else 'none'}")
+    # Biggest gap below fair value (most undervalued name).
+    gaps = [((p["price"] - p["fair_value"]) / p["fair_value"] * 100, p["symbol"])
+            for p in positions if p["fair_value"]]
+    if gaps:
+        gap, sym = min(gaps)               # most negative = most undervalued
+        if gap < 0:
+            out.append(f"Biggest gap: {sym} ~{abs(gap):.0f}% below target")
+    out.append("")
+
+    return "\n".join(out)
+
+
+def ai_synthesis(facts):
+    """Give Claude the day's facts and ask for the closing 'take' and a
+    thing to watch. Returns text, or "" if no key / library."""
     api_key = load_secret("ANTHROPIC_API_KEY")
     if not api_key:
-        print("No ANTHROPIC_API_KEY in .env - skipping AI commentary.")
+        print("No ANTHROPIC_API_KEY in .env - skipping AI synthesis.")
         return ""
-
-    # Import here (not at the top) so the whole script still runs for
-    # people who haven't installed the anthropic library yet.
     try:
         import anthropic
     except ImportError:
         print("anthropic library not installed - run: pip3 install anthropic")
         return ""
 
-    # Build a compact text summary of the portfolio to hand to Claude.
-    # We only send what's useful: ticker, day move, total gain, flag,
-    # and the news headline we already fetched.
-    lines = []
-    for p in positions:
-        line = (f"{p['symbol']}: {p['day_change_pct']:+.1f}% today, "
-                f"{p['gain_pct']:+.1f}% overall, {p['valuation']}")
-        if p["headline"]:
-            line += f" | news: {p['headline']}"
-        lines.append(line)
-    portfolio_text = "\n".join(lines)
-
-    # The prompt tells Claude who it's writing for and what we want.
     prompt = (
-        "You are a concise portfolio assistant. Below is today's snapshot "
-        "of my stock holdings (daily move, overall gain, valuation flag, and "
-        "a recent news headline where available). Write a short morning note "
-        "(4-6 sentences) explaining what stands out today and why, connecting "
-        "moves to the news where it fits. Be factual and calm. Do NOT give "
-        "buy/sell advice. End with one thing worth watching.\n\n"
-        f"{portfolio_text}"
+        "You are a concise portfolio assistant writing the closing of a daily "
+        "brief. Here are today's facts:\n\n"
+        f"{facts}\n\n"
+        "Write exactly two short sections in plain text:\n\n"
+        "🧠 THE TAKE\n"
+        "2-3 sentences on what actually mattered today and why, tying moves to "
+        "the news and valuation where it fits. Factual and calm. No buy/sell advice.\n\n"
+        "👀 ONE THING TO WATCH\n"
+        "A single forward-looking sentence.\n\n"
+        "Use those exact emoji headers. Keep it tight."
     )
 
     client = anthropic.Anthropic(api_key=api_key)
@@ -388,8 +488,18 @@ def ai_commentary(positions):
         max_tokens=400,
         messages=[{"role": "user", "content": prompt}],
     )
-    # The reply comes back as a list of content blocks; we want the text.
-    return message.content[0].text
+    # The reply is a list of blocks; newer models can include a
+    # "thinking" block first, so grab only the ones that carry text.
+    text_parts = [block.text for block in message.content
+                  if getattr(block, "type", None) == "text"]
+    return "\n".join(text_parts).strip()
+
+
+def morning_brief(positions):
+    """Build the full brief (facts + AI synthesis) and return it."""
+    facts = build_facts(positions)
+    take = ai_synthesis(facts)
+    return f"{facts}\n{take}" if take else facts
 
 
 # ---------------------------------------------------------------
@@ -401,13 +511,11 @@ if __name__ == "__main__":
     print_summary(positions)
     record_history(positions)
     make_chart(positions, os.path.join(SCRIPT_DIR, "bondpf_chart.png"))
-    check_alerts(positions)
     make_history_chart()
+    check_alerts(positions)
 
-    # Ask Claude for a morning note, print it, and email it to yourself.
-    note = ai_commentary(positions)
-    if note:
-        print("\n=== AI Morning Note ===")
-        print(note)
-        send_email("📊 BondPF: your morning note", note)
+    # Build the structured morning brief and send it to Telegram.
+    brief = morning_brief(positions)
+    print("\n" + brief)
+    send_telegram(brief)
 
