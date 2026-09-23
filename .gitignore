@@ -15,5 +15,8 @@ __pycache__/
 # Real portfolio data - never published
 my_portfolio.py
 
+# Personal investment strategy - names positions, keep private
+strategy.md
+
 # Log output from scheduled runs
 bondpf.log

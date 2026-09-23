@@ -469,14 +469,24 @@ def ai_synthesis(facts):
         print("anthropic library not installed - run: pip3 install anthropic")
         return ""
 
+    # Load your investment strategy (if present) to use as the AI's
+    # system prompt, so the brief reasons in your framework and voice.
+    strategy = ""
+    strategy_path = os.path.join(SCRIPT_DIR, "strategy.md")
+    if os.path.exists(strategy_path):
+        with open(strategy_path) as f:
+            strategy = f.read()
+
     prompt = (
-        "You are a concise portfolio assistant writing the closing of a daily "
-        "brief. Here are today's facts:\n\n"
+        "Here are today's portfolio facts:\n\n"
         f"{facts}\n\n"
-        "Write exactly two short sections in plain text:\n\n"
+        "Write exactly two short sections in plain text, applying the strategy "
+        "you were given (framework, flags, tone). Flag when a call would need a "
+        "Morningstar PDF you don't have.\n\n"
         "🧠 THE TAKE\n"
-        "2-3 sentences on what actually mattered today and why, tying moves to "
-        "the news and valuation where it fits. Factual and calm. No buy/sell advice.\n\n"
+        "2-4 sentences: what actually mattered today and why, in your framework. "
+        "Company-specific vs sector noise. Raise any risk flags that apply "
+        "(concentration, portfolio beta, binary events, unprotected gains).\n\n"
         "👀 ONE THING TO WATCH\n"
         "A single forward-looking sentence.\n\n"
         "Use those exact emoji headers. Keep it tight."
@@ -484,8 +494,9 @@ def ai_synthesis(facts):
 
     client = anthropic.Anthropic(api_key=api_key)
     message = client.messages.create(
-        model="claude-sonnet-5",
-        max_tokens=400,
+        model="claude-opus-5",
+        max_tokens=600,
+        system=strategy if strategy else anthropic.NOT_GIVEN,
         messages=[{"role": "user", "content": prompt}],
     )
     # The reply is a list of blocks; newer models can include a
@@ -512,9 +523,11 @@ if __name__ == "__main__":
     record_history(positions)
     make_chart(positions, os.path.join(SCRIPT_DIR, "bondpf_chart.png"))
     make_history_chart()
-    check_alerts(positions)
 
     # Build the structured morning brief and send it to Telegram.
+    # (The old separate dip alert is retired - the brief's TODAY'S
+    # MOVERS section already covers big drops. check_alerts() is kept
+    # in the file as a backup but no longer called.)
     brief = morning_brief(positions)
     print("\n" + brief)
     send_telegram(brief)
