@@ -112,15 +112,20 @@ def research_prompt(symbol):
     """A ready-to-paste prompt for Claude for Chrome to pull the tier-1/2
     Morningstar data Jeffrey wants from your Yahoo Premium / Morningstar."""
     return (
-        f"Research prompt for {symbol} - paste into Claude for Chrome with "
-        "your Yahoo Finance Premium / Morningstar open:\n\n"
-        f"\"Find Morningstar's data on {symbol}: fair value estimate (FVE), "
-        "economic moat rating (None / Narrow / Wide), capital allocation "
-        "rating (Poor / Standard / Exemplary), uncertainty rating (Low / "
-        "Medium / High / Very High / Extreme), current star rating, and the "
-        "bear-case value. Note the current price and any recent rating "
-        "changes. Give me the numbers concisely.\"\n\n"
-        f"When you have the answer, send it back to me as:  /data {symbol} <paste>"
+        f"Research prompt for {symbol}. Paste into Claude for Chrome while "
+        "signed in to Yahoo Finance Premium:\n\n"
+        f"\"Go to finance.yahoo.com, search {symbol}, open Research Reports, "
+        "and open the latest Morningstar analyst report. From the report "
+        "header read these exact fields: Rating (the star rating, e.g. 2/5), "
+        "Current Price, Fair Value, Economic Moat (None/Narrow/Wide), and "
+        "Stewardship (Poor/Standard/Exemplary). Then read the 'Business "
+        "Strategy and Outlook' and 'Economic Moat' sections for the "
+        "Uncertainty rating (Low/Medium/High/Very High/Extreme) and the "
+        "bear-case / downside value (it may be in the downloadable Full "
+        "Report PDF). Report: fair value, star rating, moat, stewardship, "
+        "uncertainty, bear-case value, current price, and any recent rating "
+        "change or Bullish/Bearish tag. Be concise.\"\n\n"
+        f"Send it back as:  /data {symbol} <paste the answer>"
     )
 
 
@@ -132,11 +137,12 @@ def parse_research(text):
         return None
     import anthropic
     prompt = (
-        "Extract Morningstar-style fundamentals from the text below. Reply "
-        'with ONLY JSON: {"fair_value":number or null,"moat":"None/Narrow/'
-        'Wide or null","uncertainty":"Low/Medium/High/Very High/Extreme or '
-        'null","notes":"one short phrase"}. Use null for anything not '
-        f"present.\n\nText:\n{text}"
+        "Extract Morningstar fundamentals from the text below. Reply with "
+        'ONLY JSON: {"fair_value":number or null,"moat":"None/Narrow/Wide or '
+        'null","uncertainty":"Low/Medium/High/Very High/Extreme or null",'
+        '"stewardship":"Poor/Standard/Exemplary or null","rating":"star '
+        'rating like 2/5 or null","notes":"one short phrase"}. Use null for '
+        f"anything not present.\n\nText:\n{text}"
     )
     client = anthropic.Anthropic(api_key=api_key)
     msg = client.messages.create(
@@ -248,7 +254,10 @@ def main():
                 fv = parsed.get("fair_value")
                 line = " | ".join(filter(None, [
                     f"FV ${float(fv):.2f}" if fv else None,
+                    f"{parsed['rating']} stars" if parsed.get("rating") else None,
                     f"{parsed['moat']} moat" if parsed.get("moat") else None,
+                    f"{parsed['stewardship']} stewardship"
+                    if parsed.get("stewardship") else None,
                     f"{parsed['uncertainty']} uncertainty"
                     if parsed.get("uncertainty") else None,
                     parsed.get("notes") or None,
