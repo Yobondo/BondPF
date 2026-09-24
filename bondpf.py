@@ -515,6 +515,16 @@ def build_facts(positions):
             out.append(f"Biggest gap: {sym} ~{abs(gap):.0f}% below target")
     out.append("")
 
+    # --- DATA GAPS --- holdings with no trusted Morningstar fair value,
+    # so the flags above lean on weak Tier-4 data. Prompt to upgrade.
+    starved = [p["symbol"] for p in positions
+               if p["symbol"] not in MORNINGSTAR_FV]
+    if starved:
+        out.append("📋 DATA GAPS (Tier-4 data only, no Morningstar FV)")
+        out.append(", ".join(starved))
+        out.append("Text  /research TICKER  to upgrade one.")
+        out.append("")
+
     return "\n".join(out)
 
 
@@ -526,6 +536,7 @@ def build_facts(positions):
 # like buys/sells/thesis changes, ALWAYS read) and DAILY LOG (one line
 # per day, only the recent slice is read). You can hand-edit Key Events
 # right in Obsidian and the brief will pick it up.
+FUNDAMENTALS_HEADER = "## Fundamentals"
 KEY_EVENTS_HEADER = "## Key Events"
 DAILY_LOG_HEADER = "## Daily Log"
 
@@ -592,25 +603,60 @@ def log_event(symbol, text):
     print(f"Logged key event for {symbol}: {text}")
 
 
+def write_fundamentals(symbol, line):
+    """Create or REPLACE the single-line Fundamentals section in a stock's
+    note (FV, moat, uncertainty). One updatable line, never a growing log."""
+    import re
+    os.makedirs(MEMORY_DIR, exist_ok=True)
+    path = os.path.join(MEMORY_DIR, f"{symbol.upper()}.md")
+    _ensure_memory_file(path, symbol.upper())
+    with open(path) as f:
+        content = f.read()
+    section = f"{FUNDAMENTALS_HEADER}\n{line}\n"
+    if FUNDAMENTALS_HEADER in content:
+        # replace the old fundamentals section, up to the next "## " header
+        content = re.sub(rf"{re.escape(FUNDAMENTALS_HEADER)}.*?(?=\n## |\Z)",
+                         section.rstrip(), content, count=1, flags=re.S)
+    else:
+        # insert right after the "# TITLE" line
+        lines = content.split("\n")
+        at = next((i + 1 for i, ln in enumerate(lines)
+                   if ln.startswith("# ")), 1)
+        lines.insert(at, "\n" + section.rstrip())
+        content = "\n".join(lines)
+    with open(path, "w") as f:
+        f.write(content)
+
+
 def memory_digest(symbols, days=10):
-    """Return each stock's pinned Key Events (all) plus the last `days`
-    Daily Log entries, so the brief has both long memory and recent trend."""
+    """Return each stock's Fundamentals, pinned Key Events, and the last
+    `days` Daily Log entries, so the brief has full context."""
     blocks = []
     for symbol in symbols:
         path = os.path.join(MEMORY_DIR, f"{symbol}.md")
         if not os.path.exists(path):
             continue
-        events, daily, section = [], [], None
+        fund, events, daily, section = [], [], [], None
         with open(path) as f:
             for ln in f:
                 s = ln.strip()
+                if s == FUNDAMENTALS_HEADER:
+                    section = "fund"; continue
                 if s == KEY_EVENTS_HEADER:
                     section = "events"; continue
                 if s == DAILY_LOG_HEADER:
                     section = "daily"; continue
-                if s.startswith("- "):
-                    (events if section == "events" else daily).append(s)
+                if not s or s.startswith("<!--"):
+                    continue
+                if section == "fund":
+                    fund.append(s)
+                elif s.startswith("- ") and section == "events":
+                    events.append(s)
+                elif s.startswith("- ") and section == "daily":
+                    daily.append(s)
         parts = []
+        if fund:
+            parts.append("Fundamentals: " + " ".join(fund))
         if events:
             parts.append("Key events: " + "; ".join(e[2:] for e in events))
         if daily:

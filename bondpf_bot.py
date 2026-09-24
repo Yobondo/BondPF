@@ -108,6 +108,54 @@ def parse_trade(text):
     return data
 
 
+def research_prompt(symbol):
+    """A ready-to-paste prompt for Claude for Chrome to pull the tier-1/2
+    Morningstar data Jeffrey wants from your Yahoo Premium / Morningstar."""
+    return (
+        f"Research prompt for {symbol} - paste into Claude for Chrome with "
+        "your Yahoo Finance Premium / Morningstar open:\n\n"
+        f"\"Find Morningstar's data on {symbol}: fair value estimate (FVE), "
+        "economic moat rating (None / Narrow / Wide), capital allocation "
+        "rating (Poor / Standard / Exemplary), uncertainty rating (Low / "
+        "Medium / High / Very High / Extreme), current star rating, and the "
+        "bear-case value. Note the current price and any recent rating "
+        "changes. Give me the numbers concisely.\"\n\n"
+        f"When you have the answer, send it back to me as:  /data {symbol} <paste>"
+    )
+
+
+def parse_research(text):
+    """Use Claude to pull structured fundamentals out of pasted research.
+    Returns a dict or None."""
+    api_key = bondpf.load_secret("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+    import anthropic
+    prompt = (
+        "Extract Morningstar-style fundamentals from the text below. Reply "
+        'with ONLY JSON: {"fair_value":number or null,"moat":"None/Narrow/'
+        'Wide or null","uncertainty":"Low/Medium/High/Very High/Extreme or '
+        'null","notes":"one short phrase"}. Use null for anything not '
+        f"present.\n\nText:\n{text}"
+    )
+    client = anthropic.Anthropic(api_key=api_key)
+    msg = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=250,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    bondpf.log_cost("claude-haiku-4-5-20251001", msg.usage)
+    raw = "".join(b.text for b in msg.content
+                  if getattr(b, "type", None) == "text")
+    start, end = raw.find("{"), raw.rfind("}")
+    if start == -1 or end == -1:
+        return None
+    try:
+        return json.loads(raw[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+
+
 def get_updates(token, offset):
     """Long-poll Telegram for new messages. Returns a list of updates."""
     url = f"https://api.telegram.org/bot{token}/getUpdates"
@@ -167,6 +215,47 @@ def main():
             if text.lower() in ("/reset", "reset"):
                 conversation.clear()
                 bondpf.send_telegram("Conversation cleared. Fresh start.")
+                continue
+
+            # --- Research loop ---
+            # "/research TICKER" -> hand back a Chrome prompt to run.
+            if text.lower().startswith("/research"):
+                bits = text.split()
+                if len(bits) < 2:
+                    bondpf.send_telegram("Usage: /research AVGO")
+                else:
+                    bondpf.send_telegram(research_prompt(bits[1].upper()))
+                continue
+
+            # "/data TICKER <pasted research>" -> extract and file it.
+            if text.lower().startswith("/data"):
+                bits = text.split(maxsplit=2)
+                if len(bits) < 3:
+                    bondpf.send_telegram("Usage: /data AVGO <paste the research>")
+                    continue
+                sym = bits[1].upper()
+                parsed = parse_research(bits[2])
+                if not parsed:
+                    bondpf.send_telegram("Couldn't read that research, try again.")
+                    continue
+                # Update the fair value (drives the valuation flag)...
+                if parsed.get("fair_value"):
+                    bondpf.MORNINGSTAR_FV[sym] = float(parsed["fair_value"])
+                    bondpf.save_portfolio()
+                    bondpf.reload_holdings()
+                    positions = bondpf.analyze_portfolio()
+                # ...and write the tidy Fundamentals line into the note.
+                fv = parsed.get("fair_value")
+                line = " | ".join(filter(None, [
+                    f"FV ${float(fv):.2f}" if fv else None,
+                    f"{parsed['moat']} moat" if parsed.get("moat") else None,
+                    f"{parsed['uncertainty']} uncertainty"
+                    if parsed.get("uncertainty") else None,
+                    parsed.get("notes") or None,
+                    f"updated {time.strftime('%Y-%m-%d')}",
+                ]))
+                bondpf.write_fundamentals(sym, line)
+                bondpf.send_telegram(f"Filed for {sym}: {line}")
                 continue
 
             # --- Trade confirmation flow ---
