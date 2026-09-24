@@ -5,6 +5,7 @@ stocks, and emails alerts on big daily dips.
 """
 
 import os
+import json                             # reads/writes the portfolio file
 import smtplib                          # talks to mail servers
 from datetime import date               # today's date for the history log
 from email.message import EmailMessage  # builds the email itself
@@ -39,17 +40,72 @@ MEMORY_DIR = os.path.join(SCRIPT_DIR, "memory")
 # your average cost per share (what you paid on average).
 # MORNINGSTAR_FV holds manual fair value estimates that override
 # the auto-pulled analyst targets.
-try:
-    from my_portfolio import HOLDINGS, MORNINGSTAR_FV
-except ImportError:
-    HOLDINGS = {
-        "AAPL": {"shares": 10, "avg_cost": 150.00},
-        "NVDA": {"shares": 5,  "avg_cost": 410.00},
-        "SPY":  {"shares": 2,  "avg_cost": 480.00},
-    }
-    MORNINGSTAR_FV = {
-        # "AAPL": 210.00,   <- example manual override
-    }
+PORTFOLIO_JSON = os.path.join(SCRIPT_DIR, "my_portfolio.json")
+
+
+def load_portfolio():
+    """Read holdings + fair values. Prefers my_portfolio.json (the bot
+    can edit it safely), falls back to the old my_portfolio.py, then to
+    a built-in example so the repo runs for anyone who clones it."""
+    if os.path.exists(PORTFOLIO_JSON):
+        with open(PORTFOLIO_JSON) as f:
+            data = json.load(f)
+        return data.get("holdings", {}), data.get("fair_values", {})
+    try:
+        from my_portfolio import HOLDINGS as H, MORNINGSTAR_FV as F
+        return dict(H), dict(F)
+    except ImportError:
+        example = {
+            "AAPL": {"shares": 10, "avg_cost": 150.00},
+            "NVDA": {"shares": 5,  "avg_cost": 410.00},
+            "SPY":  {"shares": 2,  "avg_cost": 480.00},
+        }
+        return example, {}
+
+
+def save_portfolio():
+    """Write the current holdings + fair values back to my_portfolio.json."""
+    with open(PORTFOLIO_JSON, "w") as f:
+        json.dump({"holdings": HOLDINGS, "fair_values": MORNINGSTAR_FV},
+                  f, indent=2)
+
+
+def reload_holdings():
+    """Re-read the portfolio file into the module globals (used after the
+    bot records a trade, so the next analysis sees the change)."""
+    global HOLDINGS, MORNINGSTAR_FV
+    HOLDINGS, MORNINGSTAR_FV = load_portfolio()
+
+
+def apply_trade(action, symbol, shares, price):
+    """Apply a confirmed buy or sell to HOLDINGS, save, and return a
+    short summary line. Averages in on a buy, removes on a full sell."""
+    symbol = symbol.upper()
+    if action == "buy":
+        if symbol in HOLDINGS:
+            old = HOLDINGS[symbol]
+            total = old["shares"] + shares
+            cost = old["shares"] * old["avg_cost"] + shares * price
+            HOLDINGS[symbol] = {"shares": total, "avg_cost": cost / total}
+        else:
+            HOLDINGS[symbol] = {"shares": shares, "avg_cost": price}
+        summary = f"BOUGHT {shares} {symbol} at ${price:.2f}"
+    else:  # sell
+        if symbol not in HOLDINGS:
+            return f"You don't hold {symbol}, nothing to sell."
+        held = HOLDINGS[symbol]["shares"]
+        if shares >= held - 1e-9:
+            del HOLDINGS[symbol]            # sold the whole position
+            summary = f"SOLD entire {symbol} position ({held} shares) at ${price:.2f}"
+        else:
+            HOLDINGS[symbol]["shares"] = held - shares
+            summary = f"SOLD {shares} {symbol} at ${price:.2f}"
+    save_portfolio()
+    log_event(symbol, summary)              # pin it to the memory vault
+    return summary
+
+
+HOLDINGS, MORNINGSTAR_FV = load_portfolio()
 
 # Email alert thresholds: percent drop vs yesterday's close.
 DIP_ALERT_PCT = 5.0       # "heads up" alert

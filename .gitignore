@@ -17,6 +17,7 @@ __pycache__/
 
 # Real portfolio data - never published
 my_portfolio.py
+my_portfolio.json
 
 # Personal investment strategy - names positions, keep private
 strategy.md
