@@ -26,3 +26,6 @@ memory/
 
 # Log output from scheduled runs
 bondpf.log
+
+# API cost tracking log
+cost_log.csv

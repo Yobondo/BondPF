@@ -29,8 +29,9 @@ def load_strategy():
     return ""
 
 
-def answer(question, positions, strategy):
-    """Send the question plus full context to Claude and return the reply."""
+def answer(question, positions, strategy, conversation):
+    """Answer using portfolio context PLUS the recent conversation, so
+    follow-up questions ('what about that one?') make sense."""
     api_key = bondpf.load_secret("ANTHROPIC_API_KEY")
     if not api_key:
         return "No ANTHROPIC_API_KEY in .env."
@@ -39,24 +40,30 @@ def answer(question, positions, strategy):
     facts = bondpf.build_facts(positions)
     history = bondpf.memory_digest([p["symbol"] for p in positions], days=10)
 
-    user_msg = (
-        "Here is my current portfolio snapshot:\n\n"
+    # Strategy + always-fresh portfolio context go in the SYSTEM prompt.
+    system = (
+        f"{strategy}\n\n"
+        "---\nCURRENT PORTFOLIO SNAPSHOT:\n"
         f"{facts}\n\n"
-        "Recent history and pinned key events from my notes:\n\n"
+        "RECENT HISTORY AND PINNED KEY EVENTS:\n"
         f"{history}\n\n"
-        f"My question: {question}\n\n"
-        "Answer as my advisor using the strategy you were given. Be concise "
-        "and direct. Flag when an answer would need a Morningstar PDF you "
-        "don't have."
+        "Answer as my advisor using the strategy. Be concise and direct. "
+        "Flag when an answer would need a Morningstar PDF you don't have."
     )
+
+    # The conversation list carries the recent back-and-forth. We append
+    # the new question, so Claude sees the whole recent thread.
+    messages = conversation + [{"role": "user", "content": question}]
 
     client = anthropic.Anthropic(api_key=api_key)
     message = client.messages.create(
         model=CHAT_MODEL,
         max_tokens=700,
-        system=strategy if strategy else anthropic.NOT_GIVEN,
-        messages=[{"role": "user", "content": user_msg}],
+        system=system,
+        messages=messages,
     )
+    cost = bondpf.log_cost(CHAT_MODEL, message.usage)
+    print(f"reply cost: ~${cost:.4f}")
     parts = [b.text for b in message.content
              if getattr(b, "type", None) == "text"]
     return "\n".join(parts).strip() or "(no reply)"
@@ -88,6 +95,11 @@ def main():
     positions = bondpf.analyze_portfolio()
     print("BondPF bot is listening. Text your bot on Telegram. Ctrl+C to stop.")
 
+    # Rolling short-term memory of the chat: a list of {role, content}.
+    # We keep only the last MAX_TURNS messages so it doesn't grow forever.
+    conversation = []
+    MAX_TURNS = 10
+
     offset = None
     while True:
         for update in get_updates(token, offset):
@@ -106,8 +118,21 @@ def main():
                 bondpf.send_telegram("Done, prices updated.")
                 continue
 
+            if text.lower() in ("/cost", "cost"):
+                bondpf.send_telegram(bondpf.cost_summary())
+                continue
+
+            if text.lower() in ("/reset", "reset"):
+                conversation.clear()
+                bondpf.send_telegram("Conversation cleared. Fresh start.")
+                continue
+
             print(f"Q: {text}")
-            reply = answer(text, positions, strategy)
+            reply = answer(text, positions, strategy, conversation)
+            # Save this exchange, then trim to the last MAX_TURNS messages.
+            conversation.append({"role": "user", "content": text})
+            conversation.append({"role": "assistant", "content": reply})
+            del conversation[:-MAX_TURNS]
             bondpf.send_telegram(reply)
         time.sleep(1)
 

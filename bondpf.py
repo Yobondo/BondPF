@@ -564,6 +564,62 @@ def memory_digest(symbols, days=10):
     return "\n\n".join(blocks)
 
 
+# ---------------------------------------------------------------
+# COST TRACKING
+# ---------------------------------------------------------------
+
+# Rough per-MILLION-token prices in USD (input, output). These power
+# the at-a-glance estimate only - VERIFY them on the Anthropic pricing
+# page, and treat the console Usage page as the real spend number.
+PRICES = {
+    "claude-opus-5":              (15.00, 75.00),
+    "claude-sonnet-5":            (3.00, 15.00),
+    "claude-haiku-4-5-20251001":  (1.00, 5.00),
+}
+
+
+def log_cost(model, usage):
+    """Log the token count and estimated cost of one Claude call to
+    cost_log.csv, and return the estimated dollars."""
+    in_tok = getattr(usage, "input_tokens", 0)
+    out_tok = getattr(usage, "output_tokens", 0)
+    in_price, out_price = PRICES.get(model, (0, 0))
+    cost = in_tok / 1_000_000 * in_price + out_tok / 1_000_000 * out_price
+    path = os.path.join(SCRIPT_DIR, "cost_log.csv")
+    new_file = not os.path.exists(path)
+    with open(path, "a") as f:
+        if new_file:
+            f.write("date,model,input_tokens,output_tokens,est_cost_usd\n")
+        f.write(f"{date.today().isoformat()},{model},{in_tok},{out_tok},"
+                f"{cost:.5f}\n")
+    return cost
+
+
+def cost_summary():
+    """Return a short text summary of total estimated spend so far."""
+    path = os.path.join(SCRIPT_DIR, "cost_log.csv")
+    if not os.path.exists(path):
+        return "No cost logged yet."
+    total, calls, today_total = 0.0, 0, 0.0
+    today = date.today().isoformat()
+    with open(path) as f:
+        next(f, None)   # skip header
+        for line in f:
+            parts = line.strip().split(",")
+            if len(parts) < 5:
+                continue
+            try:
+                c = float(parts[4])
+            except ValueError:
+                continue
+            total += c
+            calls += 1
+            if parts[0] == today:
+                today_total += c
+    return (f"Estimated spend: ${total:.3f} total across {calls} calls "
+            f"(${today_total:.3f} today). Console has the exact number.")
+
+
 def ai_synthesis(facts, history=""):
     """Give Claude the day's facts (and recent memory) and ask for the
     closing 'take' and a thing to watch. Returns text, or "" if no key."""
@@ -612,12 +668,15 @@ def ai_synthesis(facts, history=""):
     )
 
     client = anthropic.Anthropic(api_key=api_key)
+    model = "claude-opus-5"
     message = client.messages.create(
-        model="claude-opus-5",
+        model=model,
         max_tokens=600,
         system=strategy if strategy else anthropic.NOT_GIVEN,
         messages=[{"role": "user", "content": prompt}],
     )
+    cost = log_cost(model, message.usage)
+    print(f"Brief AI cost: ~${cost:.4f}")
     # The reply is a list of blocks; newer models can include a
     # "thinking" block first, so grab only the ones that carry text.
     text_parts = [block.text for block in message.content
