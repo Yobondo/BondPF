@@ -20,6 +20,12 @@ import matplotlib.pyplot as plt
 # scheduled 9AM run starts in a different folder than your terminal).
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# The "memory" folder is a plain folder of markdown files, one per
+# stock. Open it in Obsidian ("Open folder as vault") to browse it.
+# The script writes a dated line here each run and reads it back so
+# the brief remembers what it concluded on previous days.
+MEMORY_DIR = os.path.join(SCRIPT_DIR, "memory")
+
 # ---------------------------------------------------------------
 # CONFIG - the only part of the file you edit day to day
 # ---------------------------------------------------------------
@@ -456,9 +462,111 @@ def build_facts(positions):
     return "\n".join(out)
 
 
-def ai_synthesis(facts):
-    """Give Claude the day's facts and ask for the closing 'take' and a
-    thing to watch. Returns text, or "" if no key / library."""
+# ---------------------------------------------------------------
+# MEMORY (markdown vault - one file per stock, Obsidian-friendly)
+# ---------------------------------------------------------------
+
+# Each stock's markdown file has two sections: KEY EVENTS (pinned facts
+# like buys/sells/thesis changes, ALWAYS read) and DAILY LOG (one line
+# per day, only the recent slice is read). You can hand-edit Key Events
+# right in Obsidian and the brief will pick it up.
+KEY_EVENTS_HEADER = "## Key Events"
+DAILY_LOG_HEADER = "## Daily Log"
+
+
+def _ensure_memory_file(path, symbol):
+    """Create the file, or migrate an old flat file to the two-section
+    format, so both Key Events and Daily Log always exist."""
+    template = (
+        f"# {symbol}\n\n"
+        f"{KEY_EVENTS_HEADER}\n"
+        "<!-- Pinned facts: buys, sells, thesis changes. Always remembered. "
+        "Edit freely in Obsidian. -->\n\n"
+        f"{DAILY_LOG_HEADER}\n"
+    )
+    if not os.path.exists(path):
+        with open(path, "w") as f:
+            f.write(template)
+        return
+    with open(path) as f:
+        content = f.read()
+    if DAILY_LOG_HEADER not in content:
+        # Old flat format: keep its dated bullets, move them under Daily Log.
+        bullets = [ln for ln in content.splitlines() if ln.startswith("- ")]
+        with open(path, "w") as f:
+            f.write(template)
+            f.write("\n".join(bullets) + ("\n" if bullets else ""))
+
+
+def record_memory(positions):
+    """Append today's one-line snapshot to each stock's Daily Log."""
+    os.makedirs(MEMORY_DIR, exist_ok=True)
+    today = date.today().isoformat()
+    for p in positions:
+        path = os.path.join(MEMORY_DIR, f"{p['symbol']}.md")
+        _ensure_memory_file(path, p["symbol"])
+        with open(path) as f:
+            if f"- {today} |" in f.read():
+                continue   # already logged today, don't duplicate
+        line = (f"- {today} | ${p['price']:.2f} ({p['day_change_pct']:+.1f}%) "
+                f"| overall {p['gain_pct']:+.1f}% | {p['valuation']}")
+        if p["headline"]:
+            line += f" | {p['headline']}"
+        with open(path, "a") as f:   # Daily Log is the last section, so append
+            f.write(line + "\n")
+
+
+def log_event(symbol, text):
+    """Pin a permanent event (a sale, a thesis change) to a stock's
+    Key Events section so it is remembered forever, not just 10 days."""
+    os.makedirs(MEMORY_DIR, exist_ok=True)
+    path = os.path.join(MEMORY_DIR, f"{symbol}.md")
+    _ensure_memory_file(path, symbol)
+    event = f"- {date.today().isoformat()} | {text}\n"
+    with open(path) as f:
+        lines = f.readlines()
+    out, inserted = [], False
+    for ln in lines:
+        out.append(ln)
+        if ln.strip() == KEY_EVENTS_HEADER and not inserted:
+            out.append(event)          # insert right under the header
+            inserted = True
+    with open(path, "w") as f:
+        f.writelines(out if inserted else lines + [event])
+    print(f"Logged key event for {symbol}: {text}")
+
+
+def memory_digest(symbols, days=10):
+    """Return each stock's pinned Key Events (all) plus the last `days`
+    Daily Log entries, so the brief has both long memory and recent trend."""
+    blocks = []
+    for symbol in symbols:
+        path = os.path.join(MEMORY_DIR, f"{symbol}.md")
+        if not os.path.exists(path):
+            continue
+        events, daily, section = [], [], None
+        with open(path) as f:
+            for ln in f:
+                s = ln.strip()
+                if s == KEY_EVENTS_HEADER:
+                    section = "events"; continue
+                if s == DAILY_LOG_HEADER:
+                    section = "daily"; continue
+                if s.startswith("- "):
+                    (events if section == "events" else daily).append(s)
+        parts = []
+        if events:
+            parts.append("Key events: " + "; ".join(e[2:] for e in events))
+        if daily:
+            parts.append("Recent:\n" + "\n".join(daily[-days:]))
+        if parts:
+            blocks.append(f"{symbol}:\n" + "\n".join(parts))
+    return "\n\n".join(blocks)
+
+
+def ai_synthesis(facts, history=""):
+    """Give Claude the day's facts (and recent memory) and ask for the
+    closing 'take' and a thing to watch. Returns text, or "" if no key."""
     api_key = load_secret("ANTHROPIC_API_KEY")
     if not api_key:
         print("No ANTHROPIC_API_KEY in .env - skipping AI synthesis.")
@@ -477,9 +585,20 @@ def ai_synthesis(facts):
         with open(strategy_path) as f:
             strategy = f.read()
 
+    history_block = ""
+    if history:
+        history_block = (
+            "Here is the recent history of these positions (your own notes "
+            "from previous days, oldest to newest). Use it to judge whether "
+            "today is a change or a continuation, and call out anything that "
+            "has been drifting:\n\n"
+            f"{history}\n\n"
+        )
+
     prompt = (
         "Here are today's portfolio facts:\n\n"
         f"{facts}\n\n"
+        f"{history_block}"
         "Write exactly two short sections in plain text, applying the strategy "
         "you were given (framework, flags, tone). Flag when a call would need a "
         "Morningstar PDF you don't have.\n\n"
@@ -507,9 +626,11 @@ def ai_synthesis(facts):
 
 
 def morning_brief(positions):
-    """Build the full brief (facts + AI synthesis) and return it."""
+    """Build the full brief (facts + memory-aware AI synthesis)."""
     facts = build_facts(positions)
-    take = ai_synthesis(facts)
+    # Read back recent history so Jeffrey has continuity, then reason.
+    history = memory_digest([p["symbol"] for p in positions], days=10)
+    take = ai_synthesis(facts, history)
     return f"{facts}\n{take}" if take else facts
 
 
@@ -531,4 +652,8 @@ if __name__ == "__main__":
     brief = morning_brief(positions)
     print("\n" + brief)
     send_telegram(brief)
+
+    # Record today's snapshot to the memory vault AFTER the brief, so
+    # today's entry doesn't get read back into today's own analysis.
+    record_memory(positions)
 

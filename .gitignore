@@ -9,6 +9,9 @@ history.csv
 __pycache__/
 *.pyc
 
+# macOS junk
+.DS_Store
+
 # Local secrets/config (used later for email credentials)
 .env
 
@@ -17,6 +20,9 @@ my_portfolio.py
 
 # Personal investment strategy - names positions, keep private
 strategy.md
+
+# Memory vault - the AI's thesis notes per stock (Obsidian folder)
+memory/
 
 # Log output from scheduled runs
 bondpf.log
