@@ -57,17 +57,22 @@ def answer(question, positions, strategy, conversation):
     messages = conversation + [{"role": "user", "content": question}]
 
     client = anthropic.Anthropic(api_key=api_key)
-    message = client.messages.create(
-        model=CHAT_MODEL,
-        max_tokens=700,
-        system=system,
-        messages=messages,
-    )
+    try:
+        message = client.messages.create(
+            model=CHAT_MODEL,
+            max_tokens=1500,   # room for the model to think AND answer
+            system=system,
+            messages=messages,
+            timeout=90,
+        )
+    except Exception as e:
+        print(f"answer error: {e}")
+        return "⚠️ Network hiccup reaching Jeffrey. Give it a few seconds and ask again."
     cost = bondpf.log_cost(CHAT_MODEL, message.usage)
     print(f"reply cost: ~${cost:.4f}")
     parts = [b.text for b in message.content
              if getattr(b, "type", None) == "text"]
-    return "\n".join(parts).strip() or "(no reply)"
+    return "\n".join(parts).strip() or "⚠️ Got an empty reply - try rephrasing."
 
 
 def parse_trade(text):
@@ -85,11 +90,16 @@ def parse_trade(text):
         f"Message: {text}"
     )
     client = anthropic.Anthropic(api_key=api_key)
-    msg = client.messages.create(
-        model="claude-haiku-4-5-20251001",   # cheap + fast for extraction
-        max_tokens=150,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    try:
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",   # cheap + fast for extraction
+            max_tokens=150,
+            messages=[{"role": "user", "content": prompt}],
+            timeout=45,
+        )
+    except Exception as e:
+        print(f"parse_trade error: {e}")
+        return None
     bondpf.log_cost("claude-haiku-4-5-20251001", msg.usage)
     raw = "".join(b.text for b in msg.content
                   if getattr(b, "type", None) == "text").strip()
@@ -145,11 +155,16 @@ def parse_research(text):
         f"anything not present.\n\nText:\n{text}"
     )
     client = anthropic.Anthropic(api_key=api_key)
-    msg = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=250,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    try:
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=250,
+            messages=[{"role": "user", "content": prompt}],
+            timeout=45,
+        )
+    except Exception as e:
+        print(f"parse_research error: {e}")
+        return None
     bondpf.log_cost("claude-haiku-4-5-20251001", msg.usage)
     raw = "".join(b.text for b in msg.content
                   if getattr(b, "type", None) == "text")
@@ -163,12 +178,15 @@ def parse_research(text):
 
 
 def get_updates(token, offset):
-    """Long-poll Telegram for new messages. Returns a list of updates."""
+    """Long-poll Telegram for new messages. Returns a list of updates.
+    Timeouts are normal when idle, so we swallow them quietly."""
     url = f"https://api.telegram.org/bot{token}/getUpdates"
     try:
-        r = requests.get(url, params={"offset": offset, "timeout": 30},
-                         timeout=40)
+        r = requests.get(url, params={"offset": offset, "timeout": 25},
+                         timeout=35)
         return r.json().get("result", [])
+    except requests.exceptions.Timeout:
+        return []                       # expected when there's no traffic
     except Exception as e:
         print(f"poll error: {e}")
         time.sleep(3)
@@ -196,7 +214,18 @@ def main():
     # A trade waiting for you to confirm before it's written. None = none.
     pending_trade = None
 
+    # Flush any messages that arrived while the bot was offline, so it
+    # doesn't reply to stale questions from a previous session on startup.
     offset = None
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{token}/getUpdates",
+                         params={"timeout": 0}, timeout=10)
+        backlog = r.json().get("result", [])
+        if backlog:
+            offset = backlog[-1]["update_id"] + 1
+    except Exception:
+        pass
+
     while True:
         for update in get_updates(token, offset):
             offset = update["update_id"] + 1
@@ -206,6 +235,23 @@ def main():
                 continue
             text = (msg.get("text") or "").strip()
             if not text:
+                continue
+
+            if text.lower() in ("/help", "help", "/start", "commands"):
+                bondpf.send_telegram(
+                    "BondPF commands:\n\n"
+                    "• Just type a question - I answer with your portfolio, "
+                    "memory, and strategy (e.g. 'is AAPL overvalued?')\n"
+                    "• bought 5 AAPL at 250  (or sold ...) - log a trade, "
+                    "I confirm before saving\n"
+                    "• /research TICKER - I send a research prompt to run in "
+                    "Claude for Chrome\n"
+                    "• /data TICKER <paste> - paste the research back, I file "
+                    "the fair value + fundamentals\n"
+                    "• /refresh - re-pull live prices\n"
+                    "• /cost - estimated spend so far\n"
+                    "• /reset - clear our conversation memory\n"
+                    "• /help - show this list")
                 continue
 
             if text.lower() in ("/refresh", "refresh"):
